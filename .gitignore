@@ -1,0 +1,53 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.secret
+secrets/
+credentials*
+*.pass
+*.password
+
+# TLS certificates and keys (Certbot / Let's Encrypt output)
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+letsencrypt/
+certbot/
+
+# Guacamole / database runtime data
+*.sql
+*.sql.gz
+*.db
+data/
+backups/
+init/
+
+# Logs and temp files
+*.log
+logs/
+*.tmp
+*.bak
+*.swp
+*~
+
+# Downloaded archives and build artifacts
+*.tar.gz
+*.tgz
+*.zip
+*.war
+*.jar
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
