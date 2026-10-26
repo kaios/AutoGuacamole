@@ -1,13 +1,14 @@
 #!/bin/bash
 #
 # Installs Apache Guacamole (Docker) behind nginx with a Let's Encrypt
-# certificate, plus a TigerVNC + XFCE4 desktop on the host that Guacamole
+# (Certbot) or self-signed certificate, plus a TigerVNC + XFCE4 desktop on the host that Guacamole
 # connects to. Tested target: Debian 12 / Ubuntu 22.04+ with systemd.
 #
 set -euo pipefail
 
 # --- CONFIGURATION ---
 
+SCRIPT_VERSION="1.1.0"
 GUAC_VERSION="1.5.5"
 VNC_DISPLAY=":1"
 VNC_PORT="5901"
@@ -20,6 +21,7 @@ NGINX_CONF_HOST="$DOCKER_DIR/nginx.conf"
 INIT_DIR="$DOCKER_DIR/init"
 VNC_SERVICE_FILE="/etc/systemd/system/${SYSTEMD_SERVICE_NAME}.service"
 RENEW_CRON_FILE="/etc/cron.d/guacamole-certbot"
+SELF_SIGNED_DIR="$DOCKER_DIR/certs"
 # Fixed subnet for the compose network, so the firewall can let guacd reach
 # the host's VNC server without exposing VNC to the internet.
 GUAC_SUBNET="172.29.0.0/24"
@@ -75,7 +77,7 @@ cleanup_files() {
     echo "[*] Removing config files if they exist..."
     # nginx.conf can end up as a directory if Docker created the mount first
     rm -rf "$NGINX_CONF_HOST"
-    rm -rf "$INIT_DIR"
+    rm -rf "$INIT_DIR" "$SELF_SIGNED_DIR"
     rm -f "$COMPOSE_FILE" "$ENV_FILE" "$RENEW_CRON_FILE"
     if [[ -f "$VNC_SERVICE_FILE" ]]; then
         systemctl disable --now "$SYSTEMD_SERVICE_NAME" 2>/dev/null || true
@@ -135,11 +137,24 @@ read_password() {
 }
 
 collect_input() {
-    read -rp "Enter the domain name to use with Let's Encrypt: " DOMAIN
-    [[ -n "$DOMAIN" ]] || { echo "[ERROR] Domain is required."; exit 1; }
+    read -rp "Do you want to set up and configure Certbot (Let's Encrypt SSL)? (y/n): " use_certbot
+    if [[ "$use_certbot" =~ ^[Yy]$ ]]; then
+        USE_CERTBOT=true
+    else
+        USE_CERTBOT=false
+    fi
 
-    read -rp "Enter the email address for Let's Encrypt notices: " LE_EMAIL
-    [[ "$LE_EMAIL" == *@*.* ]] || { echo "[ERROR] A valid email is required."; exit 1; }
+    if $USE_CERTBOT; then
+        read -rp "Enter the domain name to use with Let's Encrypt: " DOMAIN
+        [[ -n "$DOMAIN" ]] || { echo "[ERROR] Domain is required."; exit 1; }
+
+        read -rp "Enter the email address for Let's Encrypt notices: " LE_EMAIL
+        [[ "$LE_EMAIL" == *@*.* ]] || { echo "[ERROR] A valid email is required."; exit 1; }
+    else
+        echo "[*] Skipping Certbot. A self-signed certificate will be used instead."
+        read -rp "Enter the server's domain name or IP address: " DOMAIN
+        [[ -n "$DOMAIN" ]] || { echo "[ERROR] Domain or IP is required."; exit 1; }
+    fi
 
     read -rp "Enter username for VNC session: " VNC_USER
     check_user_exists "$VNC_USER"
@@ -330,6 +345,7 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./certbot/www:/var/www/certbot:ro
       - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certs:/etc/nginx/certs:ro
 
 networks:
   default:
@@ -346,7 +362,6 @@ EOF
 # refuses to start if the ssl_certificate files are missing.
 write_nginx_conf_http() {
     echo "[*] Writing bootstrap nginx.conf (HTTP only)..."
-    mkdir -p "$DOCKER_DIR/certbot/www" "$DOCKER_DIR/certbot/conf"
     rm -rf "$NGINX_CONF_HOST"
     cat > "$NGINX_CONF_HOST" <<EOF
 server {
@@ -365,6 +380,15 @@ EOF
 }
 
 write_nginx_conf_https() {
+    local cert_path key_path
+    if $USE_CERTBOT; then
+        cert_path="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+        key_path="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+    else
+        cert_path="/etc/nginx/certs/selfsigned.crt"
+        key_path="/etc/nginx/certs/selfsigned.key"
+    fi
+
     echo "[*] Writing final nginx.conf (HTTPS)..."
     cat > "$NGINX_CONF_HOST" <<EOF
 server {
@@ -384,8 +408,8 @@ server {
     listen 443 ssl;
     server_name $DOMAIN;
 
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_certificate $cert_path;
+    ssl_certificate_key $key_path;
     ssl_protocols TLSv1.2 TLSv1.3;
 
     add_header Strict-Transport-Security "max-age=31536000" always;
@@ -429,6 +453,25 @@ request_letsencrypt_cert() {
     fi
 
     echo "[*] SSL certificate successfully obtained."
+}
+
+create_self_signed_cert() {
+    if [[ -f "$SELF_SIGNED_DIR/selfsigned.crt" && -f "$SELF_SIGNED_DIR/selfsigned.key" ]]; then
+        echo "[*] Reusing existing self-signed certificate."
+        return
+    fi
+    echo "[*] Generating self-signed certificate for $DOMAIN (valid 10 years)..."
+    local san
+    if [[ "$DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        san="IP:$DOMAIN"
+    else
+        san="DNS:$DOMAIN"
+    fi
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+        -keyout "$SELF_SIGNED_DIR/selfsigned.key" \
+        -out "$SELF_SIGNED_DIR/selfsigned.crt" \
+        -subj "/CN=$DOMAIN" -addext "subjectAltName=$san"
+    chmod 600 "$SELF_SIGNED_DIR/selfsigned.key"
 }
 
 setup_cert_renewal() {
@@ -486,7 +529,7 @@ EOF
 
 # --- MAIN SCRIPT ---
 
-echo "Starting Guacamole + SSL + VNC setup script."
+echo "Starting Guacamole + SSL + VNC setup script v$SCRIPT_VERSION."
 
 require_root
 
@@ -498,7 +541,9 @@ install_packages
 
 setup_firewall
 
-check_dns_propagation "$DOMAIN"
+if $USE_CERTBOT; then
+    check_dns_propagation "$DOMAIN"
+fi
 
 write_env_file
 
@@ -506,9 +551,16 @@ write_docker_compose
 
 write_db_init
 
-write_nginx_conf_http
+# All mount sources must exist, or Docker creates them as root-owned dirs.
+mkdir -p "$DOCKER_DIR/certbot/www" "$DOCKER_DIR/certbot/conf" "$SELF_SIGNED_DIR"
 
-request_letsencrypt_cert "$DOMAIN"
+if $USE_CERTBOT; then
+    write_nginx_conf_http
+    request_letsencrypt_cert "$DOMAIN"
+else
+    echo "[*] Skipping Certbot setup."
+    create_self_signed_cert
+fi
 
 write_nginx_conf_https
 
@@ -516,13 +568,21 @@ echo "[*] Starting Guacamole Docker stack..."
 compose up -d
 compose restart nginx
 
-setup_cert_renewal
+if $USE_CERTBOT; then
+    setup_cert_renewal
+else
+    rm -f "$RENEW_CRON_FILE"
+fi
 
 setup_vnc
 
 echo
 echo "[*] Setup complete."
 echo "    URL:      https://$DOMAIN/"
+if ! $USE_CERTBOT; then
+    echo "    SSL:      self-signed certificate. Your browser will show a warning;"
+    echo "              accept it once to continue."
+fi
 echo "    Login:    guacadmin / (the password you entered)"
 echo "    Desktop:  'XFCE Desktop ($VNC_USER)' connection is pre-configured."
 echo "    Secrets:  $ENV_FILE"
